@@ -122,50 +122,115 @@ def image_to_base64(img: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
-def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[Image.Image]) -> dict:
-    """
-    Generate image using OpenAI's API with Bengali text references.
+REWRITE_SYSTEM_PROMPT = """You are an image-generation prompt rewriter. Your job is to transform the user's raw prompt into a clean, precise prompt for an AI image generator (gpt-image-1).
 
-    This is the core of your idea:
-    - Pass the rendered Bengali text images as references
-    - Let the model incorporate them naturally into the generated image
-    """
+You will be given:
+- The user's raw prompt (which may contain Bengali text references)
+- The number of user-uploaded images
+- The number of app-rendered Bengali text images
+- The Bengali text strings that were extracted
+
+IMAGE ORDERING CONVENTION:
+- User-uploaded images come FIRST (positions 1..N)
+- App-rendered Bengali text images come AFTER (positions N+1..M)
+- Refer to images by ordinal position: "the first attached image", "the second attached image", etc.
+
+RULES FOR USER-UPLOADED IMAGES:
+- Describe them as backgrounds, references, or source material depending on context
+- Example: "The first attached image is the background scene"
+
+RULES FOR BENGALI TEXT IMAGES:
+- These are pre-rendered text images that MUST be used exactly as-is
+- Instruct: "Use this image as-is. Do not interpret it as text. You may change its color or scale it, but do not alter the shapes."
+- If the user's original prompt mentions a color for the Bengali text (e.g. "red বাংলা"), include an instruction like "Change the color of the text in the Nth attached image to red."
+- Place the text appropriately based on context (title at top, caption at bottom, etc.)
+
+OUTPUT RULES:
+- Output ONLY the rewritten prompt — no explanations, no preamble
+- Do NOT include any Bengali Unicode characters in your output
+- Reference all images by their ordinal number
+- Be concise but precise about placement, styling, and composition"""
+
+
+def rewrite_prompt(raw_prompt: str, num_user_images: int, bengali_texts: list[str]) -> str:
+    """Call gpt-4o-mini to rewrite the user's prompt for image generation."""
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    # Remove Bengali text from the prompt - we only want to send the rendered image
-    cleaned_prompt = prompt
-    for text in bengali_texts:
-        cleaned_prompt = cleaned_prompt.replace(text, "[TEXT FROM IMAGE]")
+    num_text_images = len(bengali_texts)
 
-    # Also remove quoted versions
-    cleaned_prompt = re.sub(r'["\']?\[TEXT FROM IMAGE\]["\']?', '[TEXT FROM IMAGE]', cleaned_prompt)
+    user_message = f"""Raw prompt: {raw_prompt}
 
-    # Build enhanced prompt that references the image without including Bengali unicode
-    enhanced_prompt = cleaned_prompt + "\n\n"
-    enhanced_prompt += "CRITICAL INSTRUCTION: I am providing a reference image containing text. "
-    enhanced_prompt += "You MUST copy this exact text into the generated image - do not recreate or modify it. "
-    enhanced_prompt += "Use the text from the reference image exactly as rendered, placing it appropriately based on context (e.g., as a title at the top for a poster)."
-    
-    # Convert images to bytes for the API
+Number of user-uploaded images: {num_user_images}
+Number of app-rendered Bengali text images: {num_text_images}
+Bengali text strings extracted: {json.dumps(bengali_texts, ensure_ascii=False)}
+
+Rewrite this into a clean image-generation prompt following the rules."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message}
+        ],
+        temperature=0.3,
+        max_tokens=1024
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[Image.Image], user_images: list[Image.Image] = None, rewritten_prompt: str = None) -> dict:
+    """
+    Generate image using OpenAI's API with Bengali text references and user images.
+
+    Pipeline:
+    1. Rewrite the prompt using gpt-4o-mini (or use cached rewritten_prompt if provided)
+    2. Send rewritten prompt + all images (user uploads first, then rendered text) to gpt-image-1
+    """
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    if user_images is None:
+        user_images = []
+
+    # Use provided rewritten prompt, or call the LLM rewriter
+    if not rewritten_prompt:
+        try:
+            rewritten_prompt = rewrite_prompt(prompt, len(user_images), bengali_texts)
+        except Exception as e:
+            print(f"Prompt rewrite failed, falling back to manual prompt: {e}")
+            rewritten_prompt = prompt
+            for text in bengali_texts:
+                rewritten_prompt = rewritten_prompt.replace(text, "[TEXT FROM IMAGE]")
+            rewritten_prompt = re.sub(r'["\']?\[TEXT FROM IMAGE\]["\']?', '[TEXT FROM IMAGE]', rewritten_prompt)
+            rewritten_prompt += "\n\nCRITICAL INSTRUCTION: I am providing a reference image containing text. "
+            rewritten_prompt += "You MUST copy this exact text into the generated image - do not recreate or modify it. "
+            rewritten_prompt += "Use the text from the reference image exactly as rendered, placing it appropriately based on context."
+
+    # Build image list: user uploads first, then rendered Bengali text
     # Note: BytesIO needs a .name attribute with .png extension for OpenAI to detect mimetype
     image_bytes = []
+    for i, img in enumerate(user_images):
+        buffer = BytesIO()
+        img.save(buffer, format='PNG')
+        buffer.seek(0)
+        buffer.name = f"user_upload_{i}.png"
+        image_bytes.append(buffer)
     for i, img in enumerate(rendered_images):
         buffer = BytesIO()
         img.save(buffer, format='PNG')
         buffer.seek(0)
-        buffer.name = f"bengali_text_{i}.png"  # Required for OpenAI to detect mimetype
+        buffer.name = f"bengali_text_{i}.png"
         image_bytes.append(buffer)
-    
+
     try:
         # Use the edit endpoint with reference images
         response = client.images.edit(
-            model="gpt-image-1",  # or "gpt-image-1.5" if available
+            model="gpt-image-1",
             image=image_bytes,
-            prompt=enhanced_prompt,
+            prompt=rewritten_prompt,
             n=1,
             size="1024x1024"
         )
-        
+
         result_b64 = None
         if response.data:
             item = response.data[0]
@@ -175,29 +240,28 @@ def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[
                 import requests
                 img_response = requests.get(item.url)
                 result_b64 = base64.b64encode(img_response.content).decode('utf-8')
-        
+
         return {
             "success": True,
             "image": result_b64,
-            "prompt_used": enhanced_prompt
+            "prompt_used": rewritten_prompt
         }
-        
+
     except Exception as e:
         error_msg = str(e)
-        
+
         # If edit endpoint fails, try generation with just the prompt
-        # This is a fallback - won't have the reference images but shows the flow works
         try:
             print(f"Edit endpoint failed: {error_msg}")
             print("Trying generation endpoint as fallback...")
-            
+
             response = client.images.generate(
                 model="gpt-image-1",
-                prompt=enhanced_prompt,
+                prompt=rewritten_prompt,
                 n=1,
                 size="1024x1024"
             )
-            
+
             result_b64 = None
             if response.data:
                 item = response.data[0]
@@ -207,14 +271,14 @@ def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[
                     import requests
                     img_response = requests.get(item.url)
                     result_b64 = base64.b64encode(img_response.content).decode('utf-8')
-            
+
             return {
                 "success": True,
                 "image": result_b64,
-                "prompt_used": enhanced_prompt,
+                "prompt_used": rewritten_prompt,
                 "note": "Used generation endpoint (fallback). Reference images not included."
             }
-            
+
         except Exception as e2:
             return {
                 "success": False,
@@ -414,6 +478,82 @@ HTML_TEMPLATE = '''
         .example-chip .bengali {
             font-family: 'Noto Sans Bengali', sans-serif;
             color: var(--accent-light);
+        }
+
+        .upload-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .upload-area {
+            position: relative;
+            border: 1px dashed var(--border-accent);
+            border-radius: var(--radius-md);
+            padding: 1.25rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background: var(--bg-secondary);
+        }
+
+        .upload-area:hover {
+            border-color: var(--accent);
+            background: var(--accent-glow);
+        }
+
+        .upload-area input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .upload-area-text {
+            font-size: 0.85rem;
+            color: var(--text-tertiary);
+        }
+
+        .upload-area-text strong {
+            color: var(--accent-light);
+        }
+
+        .upload-thumbnails {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            margin-top: 0.75rem;
+        }
+
+        .upload-thumb {
+            position: relative;
+            width: 64px;
+            height: 64px;
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            border: 1px solid var(--border-accent);
+        }
+
+        .upload-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .upload-thumb-remove {
+            position: absolute;
+            top: 2px;
+            right: 2px;
+            width: 18px;
+            height: 18px;
+            background: rgba(0,0,0,0.7);
+            border: none;
+            border-radius: 50%;
+            color: white;
+            font-size: 11px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
         }
 
         .btn {
@@ -728,6 +868,15 @@ HTML_TEMPLATE = '''
                 </div>
             </div>
 
+            <div class="upload-group">
+                <label>Attach your own images (optional)</label>
+                <div class="upload-area" id="uploadArea">
+                    <input type="file" multiple accept="image/*" id="fileInput" onchange="handleFileSelect(event)">
+                    <div class="upload-area-text"><strong>Click to upload</strong> or drag and drop</div>
+                </div>
+                <div class="upload-thumbnails" id="uploadThumbnails"></div>
+            </div>
+
             <div style="display: flex; gap: 0.75rem;">
                 <button class="btn btn-primary" onclick="generateImage()" id="generateBtn" style="flex: 1;">
                     Generate
@@ -735,11 +884,11 @@ HTML_TEMPLATE = '''
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/>
                     </svg>
                 </button>
-                <button class="btn btn-secondary" onclick="renderOnly()" id="renderBtn" title="Test Bengali text rendering without calling OpenAI">
+                <button class="btn btn-secondary" onclick="renderOnly()" id="renderBtn" title="Test Bengali text rendering without calling the API">
                     Render
                 </button>
-                <button class="btn btn-secondary" onclick="previewPrompt()" id="promptBtn" title="Show the prompt that would be sent to OpenAI">
-                    Prompt
+                <button class="btn btn-secondary" onclick="previewPrompt()" id="promptBtn" title="Show the rewritten prompt that would be sent to the API">
+                    Rewritten Prompt
                 </button>
             </div>
 
@@ -778,7 +927,7 @@ HTML_TEMPLATE = '''
                 <div class="step">
                     <div class="step-num">৩</div>
                     <div class="step-title">Generate</div>
-                    <div class="step-desc">Send to OpenAI</div>
+                    <div class="step-desc">Send to AI</div>
                 </div>
                 <div class="step">
                     <div class="step-num">৪</div>
@@ -790,8 +939,45 @@ HTML_TEMPLATE = '''
     </div>
 
     <script>
+        // Track uploaded files as base64 data URLs
+        let uploadedFiles = [];
+
+        // Cache for rewritten prompts — avoids redundant gpt-4o-mini calls
+        let rewriteCache = { prompt: null, numImages: null, rewrittenPrompt: null };
+
         function setPrompt(text) {
             document.getElementById('prompt').value = text;
+        }
+
+        function handleFileSelect(event) {
+            const files = Array.from(event.target.files);
+            files.forEach(file => {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    uploadedFiles.push(e.target.result);
+                    renderUploadThumbnails();
+                };
+                reader.readAsDataURL(file);
+            });
+            // Reset input so the same file can be re-selected
+            event.target.value = '';
+        }
+
+        function removeUpload(index) {
+            uploadedFiles.splice(index, 1);
+            renderUploadThumbnails();
+        }
+
+        function renderUploadThumbnails() {
+            const container = document.getElementById('uploadThumbnails');
+            container.innerHTML = '';
+            uploadedFiles.forEach((dataUrl, i) => {
+                const thumb = document.createElement('div');
+                thumb.className = 'upload-thumb';
+                thumb.innerHTML = '<img src="' + dataUrl + '">' +
+                    '<button class="upload-thumb-remove" onclick="removeUpload(' + i + ')">&#215;</button>';
+                container.appendChild(thumb);
+            });
         }
 
         async function previewPrompt() {
@@ -813,14 +999,27 @@ HTML_TEMPLATE = '''
                 const response = await fetch('/preview-prompt', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt })
+                    body: JSON.stringify({
+                        prompt: prompt,
+                        num_user_images: uploadedFiles.length
+                    })
                 });
 
                 const data = await response.json();
 
-                status.className = 'status success';
-                status.innerHTML = '<strong>Prompt preview:</strong><pre style="margin-top:0.5rem;white-space:pre-wrap;font-size:0.8rem;color:var(--text-secondary);">' +
-                    data.openai_prompt.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
+                if (data.error) {
+                    status.className = 'status error';
+                    status.textContent = data.error;
+                } else {
+                    // Cache the rewritten prompt
+                    rewriteCache = { prompt: prompt, numImages: uploadedFiles.length, rewrittenPrompt: data.openai_prompt };
+
+                    const method = data.rewrite_method === 'llm' ? ' (LLM rewritten)' : ' (fallback)';
+                    status.className = 'status success';
+                    status.innerHTML = '<strong>Prompt preview' + method + ':</strong>' +
+                        '<pre style="margin-top:0.5rem;white-space:pre-wrap;font-size:0.8rem;color:var(--text-secondary);">' +
+                        data.openai_prompt.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</pre>';
+                }
 
             } catch (err) {
                 status.className = 'status error';
@@ -828,7 +1027,7 @@ HTML_TEMPLATE = '''
             }
 
             btn.disabled = false;
-            btn.textContent = 'Prompt';
+            btn.textContent = 'Rewritten Prompt';
         }
 
         async function renderOnly() {
@@ -879,7 +1078,7 @@ HTML_TEMPLATE = '''
             }
 
             btn.disabled = false;
-            btn.textContent = 'Render Only';
+            btn.textContent = 'Render';
         }
 
         async function generateImage() {
@@ -924,13 +1123,20 @@ HTML_TEMPLATE = '''
                     });
                 }
 
-                // Step 2: Now call OpenAI (the slow part)
-                status.innerHTML = '<span class="spinner"></span> Generating image with OpenAI...';
+                // Step 2: Call generate with prompt + user images
+                // Use cached rewritten prompt if inputs haven't changed
+                const payload = { prompt: prompt, user_images: uploadedFiles };
+                if (rewriteCache.prompt === prompt && rewriteCache.numImages === uploadedFiles.length && rewriteCache.rewrittenPrompt) {
+                    payload.rewritten_prompt = rewriteCache.rewrittenPrompt;
+                    status.innerHTML = '<span class="spinner"></span> Generating image (using cached prompt)...';
+                } else {
+                    status.innerHTML = '<span class="spinner"></span> Rewriting prompt & generating image...';
+                }
 
                 const response = await fetch('/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt })
+                    body: JSON.stringify(payload)
                 });
 
                 const data = await response.json();
@@ -991,11 +1197,40 @@ def render():
     })
 
 
+@app.route('/rewrite-prompt', methods=['POST'])
+def rewrite_prompt_endpoint():
+    """Rewrite a prompt using gpt-4o-mini."""
+    data = request.json
+    prompt = data.get('prompt', '')
+    num_user_images = data.get('num_user_images', 0)
+    bengali_texts = data.get('bengali_texts', None)
+
+    if not prompt:
+        return jsonify({"rewritten_prompt": ""})
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OPENAI_API_KEY not set"}), 400
+
+    # Extract Bengali text if not provided
+    if bengali_texts is None:
+        bengali_texts = extract_bengali_text(prompt)
+
+    try:
+        rewritten = rewrite_prompt(prompt, num_user_images, bengali_texts)
+        return jsonify({
+            "rewritten_prompt": rewritten,
+            "bengali_texts": bengali_texts
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/preview-prompt', methods=['POST'])
 def preview_prompt():
     """Show the prompt that would be sent to OpenAI without calling the API."""
     data = request.json
     prompt = data.get('prompt', '')
+    num_user_images = data.get('num_user_images', 0)
 
     if not prompt:
         return jsonify({"prompt": ""})
@@ -1003,7 +1238,20 @@ def preview_prompt():
     # Extract Bengali text
     bengali_texts = extract_bengali_text(prompt)
 
-    # Build the same prompt that generate_image would build
+    # Try LLM rewrite if API key is available
+    if OPENAI_API_KEY:
+        try:
+            rewritten = rewrite_prompt(prompt, num_user_images, bengali_texts)
+            return jsonify({
+                "original_prompt": prompt,
+                "bengali_texts": bengali_texts,
+                "openai_prompt": rewritten,
+                "rewrite_method": "llm"
+            })
+        except Exception as e:
+            print(f"LLM rewrite failed in preview: {e}")
+
+    # Fallback: build prompt the old way
     cleaned_prompt = prompt
     for text in bengali_texts:
         cleaned_prompt = cleaned_prompt.replace(text, "[TEXT FROM IMAGE]")
@@ -1018,7 +1266,8 @@ def preview_prompt():
     return jsonify({
         "original_prompt": prompt,
         "bengali_texts": bengali_texts,
-        "openai_prompt": enhanced_prompt
+        "openai_prompt": enhanced_prompt,
+        "rewrite_method": "fallback"
     })
 
 
@@ -1026,12 +1275,24 @@ def preview_prompt():
 def generate():
     data = request.json
     prompt = data.get('prompt', '')
+    user_images_b64 = data.get('user_images', [])
+    cached_rewritten_prompt = data.get('rewritten_prompt', None)
 
     if not prompt:
         return jsonify({"success": False, "error": "No prompt provided"})
 
     if not OPENAI_API_KEY:
         return jsonify({"success": False, "error": "OPENAI_API_KEY not set"})
+
+    # Decode user-uploaded images
+    user_images = []
+    for b64_str in user_images_b64:
+        # Strip data URL prefix if present
+        if ',' in b64_str:
+            b64_str = b64_str.split(',', 1)[1]
+        img_data = base64.b64decode(b64_str)
+        img = Image.open(BytesIO(img_data)).convert('RGBA')
+        user_images.append(img)
 
     # Extract Bengali text
     bengali_texts = extract_bengali_text(prompt)
@@ -1043,18 +1304,27 @@ def generate():
         img = render_bengali_text(text)
         rendered_images.append(img)
         rendered_b64.append(image_to_base64(img))
-    
-    if not bengali_texts:
-        # No Bengali text found - just do normal generation
+
+    if not bengali_texts and not user_images:
+        # No Bengali text and no user images - just do normal generation
         try:
+            # Use cached prompt if available, otherwise rewrite
+            if cached_rewritten_prompt:
+                rewritten = cached_rewritten_prompt
+            else:
+                try:
+                    rewritten = rewrite_prompt(prompt, 0, [])
+                except Exception:
+                    rewritten = prompt
+
             client = OpenAI(api_key=OPENAI_API_KEY)
             response = client.images.generate(
                 model="gpt-image-1",
-                prompt=prompt,
+                prompt=rewritten,
                 n=1,
                 size="1024x1024"
             )
-            
+
             result_b64 = None
             if response.data:
                 item = response.data[0]
@@ -1064,21 +1334,21 @@ def generate():
                     import requests as req
                     img_response = req.get(item.url)
                     result_b64 = base64.b64encode(img_response.content).decode('utf-8')
-            
+
             return jsonify({
                 "success": True,
                 "image": result_b64,
-                "prompt_used": prompt,
+                "prompt_used": rewritten,
                 "rendered_texts": [],
-                "note": "No Bengali text detected - used standard generation"
+                "note": "No Bengali text detected and no user images - used standard generation"
             })
         except Exception as e:
             return jsonify({"success": False, "error": str(e)})
-    
-    # Generate with Bengali text references
-    result = generate_image(prompt, bengali_texts, rendered_images)
+
+    # Generate with Bengali text references and user images
+    result = generate_image(prompt, bengali_texts, rendered_images, user_images, rewritten_prompt=cached_rewritten_prompt)
     result["rendered_texts"] = rendered_b64
-    
+
     return jsonify(result)
 
 

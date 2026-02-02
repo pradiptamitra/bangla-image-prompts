@@ -4,11 +4,14 @@ Bengali Image Generator - Web Application
 A Flask web app that:
 1. Takes a prompt with Bengali text
 2. Renders Bengali text as clean PNG images
-3. Sends to OpenAI's gpt-image-1.5 with the text images as references
+3. Sends to Gemini 2.5 Flash with the text images as references
 4. Returns the generated image
+
+Uses OpenAI gpt-4o-mini for prompt rewriting, Gemini for image generation.
 
 Run with:
     export OPENAI_API_KEY='your-key'
+    export GEMINI_API_KEY='your-key'
     python app.py
 
 Then open http://localhost:5000
@@ -23,11 +26,14 @@ from flask import Flask, render_template_string, request, jsonify
 
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
 # Configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # Font paths for different operating systems
 FONT_PATHS = [
     # Mac - if you download Noto Sans Bengali
@@ -181,13 +187,12 @@ Rewrite this into a clean image-generation prompt following the rules."""
 
 def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[Image.Image], user_images: list[Image.Image] = None, rewritten_prompt: str = None) -> dict:
     """
-    Generate image using OpenAI's API with Bengali text references and user images.
+    Generate image using Gemini's API with Bengali text references and user images.
 
     Pipeline:
     1. Rewrite the prompt using gpt-4o-mini (or use cached rewritten_prompt if provided)
-    2. Send rewritten prompt + all images (user uploads first, then rendered text) to gpt-image-1
+    2. Send rewritten prompt + all images (user uploads first, then rendered text) to Gemini
     """
-    client = OpenAI(api_key=OPENAI_API_KEY)
     if user_images is None:
         user_images = []
 
@@ -205,41 +210,26 @@ def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[
             rewritten_prompt += "You MUST copy this exact text into the generated image - do not recreate or modify it. "
             rewritten_prompt += "Use the text from the reference image exactly as rendered, placing it appropriately based on context."
 
-    # Build image list: user uploads first, then rendered Bengali text
-    # Note: BytesIO needs a .name attribute with .png extension for OpenAI to detect mimetype
-    image_bytes = []
-    for i, img in enumerate(user_images):
-        buffer = BytesIO()
-        img.save(buffer, format='PNG')
-        buffer.seek(0)
-        buffer.name = f"user_upload_{i}.png"
-        image_bytes.append(buffer)
-    for i, img in enumerate(rendered_images):
-        buffer = BytesIO()
-        img.save(buffer, format='PNG')
-        buffer.seek(0)
-        buffer.name = f"bengali_text_{i}.png"
-        image_bytes.append(buffer)
+    # Build contents list: user uploads first, then rendered Bengali text, then prompt
+    contents = []
+    for img in user_images:
+        contents.append(img)
+    for img in rendered_images:
+        contents.append(img)
+    contents.append(rewritten_prompt)
 
     try:
-        # Use the edit endpoint with reference images
-        response = client.images.edit(
-            model="gpt-image-1",
-            image=image_bytes,
-            prompt=rewritten_prompt,
-            n=1,
-            size="1024x1024"
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=contents,
         )
 
         result_b64 = None
-        if response.data:
-            item = response.data[0]
-            if hasattr(item, 'b64_json') and item.b64_json:
-                result_b64 = item.b64_json
-            elif hasattr(item, 'url') and item.url:
-                import requests
-                img_response = requests.get(item.url)
-                result_b64 = base64.b64encode(img_response.content).decode('utf-8')
+        for part in response.parts:
+            if part.inline_data is not None:
+                result_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                break
 
         return {
             "success": True,
@@ -248,42 +238,10 @@ def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[
         }
 
     except Exception as e:
-        error_msg = str(e)
-
-        # If edit endpoint fails, try generation with just the prompt
-        try:
-            print(f"Edit endpoint failed: {error_msg}")
-            print("Trying generation endpoint as fallback...")
-
-            response = client.images.generate(
-                model="gpt-image-1",
-                prompt=rewritten_prompt,
-                n=1,
-                size="1024x1024"
-            )
-
-            result_b64 = None
-            if response.data:
-                item = response.data[0]
-                if hasattr(item, 'b64_json') and item.b64_json:
-                    result_b64 = item.b64_json
-                elif hasattr(item, 'url') and item.url:
-                    import requests
-                    img_response = requests.get(item.url)
-                    result_b64 = base64.b64encode(img_response.content).decode('utf-8')
-
-            return {
-                "success": True,
-                "image": result_b64,
-                "prompt_used": rewritten_prompt,
-                "note": "Used generation endpoint (fallback). Reference images not included."
-            }
-
-        except Exception as e2:
-            return {
-                "success": False,
-                "error": f"Edit failed: {error_msg}. Generate failed: {str(e2)}"
-            }
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 # HTML Template
@@ -1281,8 +1239,8 @@ def generate():
     if not prompt:
         return jsonify({"success": False, "error": "No prompt provided"})
 
-    if not OPENAI_API_KEY:
-        return jsonify({"success": False, "error": "OPENAI_API_KEY not set"})
+    if not GEMINI_API_KEY:
+        return jsonify({"success": False, "error": "GEMINI_API_KEY not set"})
 
     # Decode user-uploaded images
     user_images = []
@@ -1317,23 +1275,17 @@ def generate():
                 except Exception:
                     rewritten = prompt
 
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            response = client.images.generate(
-                model="gpt-image-1",
-                prompt=rewritten,
-                n=1,
-                size="1024x1024"
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-image",
+                contents=[rewritten],
             )
 
             result_b64 = None
-            if response.data:
-                item = response.data[0]
-                if hasattr(item, 'b64_json') and item.b64_json:
-                    result_b64 = item.b64_json
-                elif hasattr(item, 'url') and item.url:
-                    import requests as req
-                    img_response = req.get(item.url)
-                    result_b64 = base64.b64encode(img_response.content).decode('utf-8')
+            for part in response.parts:
+                if part.inline_data is not None:
+                    result_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                    break
 
             return jsonify({
                 "success": True,
@@ -1353,12 +1305,19 @@ def generate():
 
 
 if __name__ == '__main__':
+    if not GEMINI_API_KEY:
+        print("="*60)
+        print("WARNING: GEMINI_API_KEY environment variable not set!")
+        print("Image generation will not work.")
+        print("Set it with: export GEMINI_API_KEY='your-key'")
+        print("="*60)
     if not OPENAI_API_KEY:
         print("="*60)
         print("WARNING: OPENAI_API_KEY environment variable not set!")
+        print("Prompt rewriting will fall back to manual mode.")
         print("Set it with: export OPENAI_API_KEY='your-key'")
         print("="*60)
-    
-    print("\n🚀 Starting Bengali Image Generator...")
+
+    print("\nStarting Bengali Image Generator...")
     print("   Open http://localhost:5000 in your browser\n")
     app.run(debug=True, host='0.0.0.0', port=5000)

@@ -81,16 +81,21 @@ def extract_bengali_text(prompt: str) -> list[str]:
     return list(set(m.strip() for m in matches if m.strip()))
 
 
-def render_bengali_text(text: str, font_size: int = 120) -> Image.Image:
-    """Render Bengali text as a PNG with transparent background."""
+def render_bengali_text(text: str, font_size: int = 120, mask: bool = False) -> Image.Image:
+    """Render Bengali text as an image.
+
+    If mask=False: plain black text on white background.
+    If mask=True:  text on a bordered plaque with colored circle overlay
+                   to disguise it as a graphic and disrupt text recognition.
+    """
     font = None
-    
+
     if BENGALI_FONT_PATH:
         try:
             font = ImageFont.truetype(BENGALI_FONT_PATH, font_size)
         except (OSError, IOError) as e:
             print(f"Warning: Could not load font from {BENGALI_FONT_PATH}: {e}")
-    
+
     if font is None:
         print("="*60)
         print("ERROR: No Bengali font found!")
@@ -101,23 +106,79 @@ def render_bengali_text(text: str, font_size: int = 120) -> Image.Image:
         print("  ~/Library/Fonts/NotoSansBengali-SemiBold.ttf")
         print("  OR in the same folder as this script: ./NotoSansBengali-SemiBold.ttf")
         print("="*60)
-        # Use default font as fallback (won't render Bengali correctly)
         font = ImageFont.load_default()
-    
+
     # Measure text
-    temp_img = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+    temp_img = Image.new('RGB', (1, 1), (255, 255, 255))
     temp_draw = ImageDraw.Draw(temp_img)
     bbox = temp_draw.textbbox((0, 0), text, font=font)
-    
-    padding = 30
-    img_width = bbox[2] - bbox[0] + padding * 2
-    img_height = bbox[3] - bbox[1] + padding * 2
-    
-    # Create image with transparent background
-    img = Image.new('RGBA', (img_width, img_height), (255, 255, 255, 0))
+
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    if not mask:
+        # Plain mode: black text on white background
+        padding = 30
+        img_width = text_w + padding * 2
+        img_height = text_h + padding * 2
+        img = Image.new('RGB', (img_width, img_height), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        draw.text((padding - bbox[0], padding - bbox[1]), text, font=font, fill='black')
+        return img
+
+    # Masked mode: plaque + circle overlay on white background
+    pad_x = int(text_h * 0.6)
+    pad_y = int(text_h * 0.45)
+    border_width = max(3, font_size // 30)
+    corner_radius = int(text_h * 0.35)
+
+    img_width = text_w + pad_x * 2
+    img_height = text_h + pad_y * 2
+
+    img = Image.new('RGB', (img_width, img_height), (255, 255, 255))
     draw = ImageDraw.Draw(img)
-    draw.text((padding - bbox[0], padding - bbox[1]), text, font=font, fill='black')
-    
+
+    # Center the text
+    text_x = (img_width - text_w) // 2 - bbox[0]
+    text_y = (img_height - text_h) // 2 - bbox[1]
+    draw.text((text_x, text_y), text, font=font, fill='black')
+
+    # Scatter non-overlapping semi-transparent rectangles to disrupt text recognition
+    import random
+    random.seed(hash(text))
+    overlay = Image.new('RGBA', (img_width, img_height), (0, 0, 0, 0))
+    ov_draw = ImageDraw.Draw(overlay)
+    palette = [(180, 155, 120), (150, 135, 115)]  # light brown / tan
+    min_w = max(10, int(text_h * 0.15))
+    max_w = max(25, int(text_h * 0.4))
+    min_h = max(8, int(text_h * 0.1))
+    max_h = max(20, int(text_h * 0.3))
+    num_rects = max(6, (img_width * img_height) // (max_w * max_h * 10))
+    placed = []
+    attempts = 0
+    while len(placed) < num_rects and attempts < num_rects * 20:
+        attempts += 1
+        rw = random.randint(min_w, max_w)
+        rh = random.randint(min_h, max_h)
+        rx = random.randint(0, img_width - rw)
+        ry = random.randint(0, img_height - rh)
+        # Check for overlap with already placed rectangles
+        overlap = False
+        for (px, py, pw, ph) in placed:
+            if rx < px + pw and rx + rw > px and ry < py + ph and ry + rh > py:
+                overlap = True
+                break
+        if overlap:
+            continue
+        placed.append((rx, ry, rw, rh))
+        color = random.choice(palette)
+        alpha = random.randint(80, 140)
+        ov_draw.rectangle([rx, ry, rx + rw, ry + rh], fill=(*color, alpha))
+
+    img = img.convert('RGBA')
+    img = Image.alpha_composite(img, overlay)
+    img = img.convert('RGB')
+
     return img
 
 
@@ -128,38 +189,51 @@ def image_to_base64(img: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
-REWRITE_SYSTEM_PROMPT = """You are an image-generation prompt rewriter. Your job is to transform the user's raw prompt into a clean, precise prompt for an AI image generator (gpt-image-1).
+REWRITE_SYSTEM_PROMPT = """You are an image-generation prompt rewriter. Your job is to transform the user's raw prompt into a clean, precise prompt for an AI image generator.
 
 You will be given:
 - The user's raw prompt (which may contain Bengali text references)
 - The number of user-uploaded images
-- The number of app-rendered Bengali text images
-- The Bengali text strings that were extracted
+- The number of app-rendered Bengali text images (these are graphic overlays, NOT text)
 
 IMAGE ORDERING CONVENTION:
 - User-uploaded images come FIRST (positions 1..N)
-- App-rendered Bengali text images come AFTER (positions N+1..M)
+- App-rendered graphic overlays come AFTER (positions N+1..M)
 - Refer to images by ordinal position: "the first attached image", "the second attached image", etc.
 
 RULES FOR USER-UPLOADED IMAGES:
-- Describe them as backgrounds, references, or source material depending on context
+- Describe them as the raw prompt does. If the user attaches as image and describes them as background, do the same.
 - Example: "The first attached image is the background scene"
 
-RULES FOR BENGALI TEXT IMAGES:
-- These are pre-rendered text images that MUST be used exactly as-is
-- Instruct: "Use this image as-is. Do not interpret it as text. You may change its color or scale it, but do not alter the shapes."
-- If the user's original prompt mentions a color for the Bengali text (e.g. "red বাংলা"), include an instruction like "Change the color of the text in the Nth attached image to red."
-- Place the text appropriately based on context (title at top, caption at bottom, etc.)
+RULES FOR GRAPHIC OVERLAY IMAGES (the app-rendered ones):
+- These are pre-rendered GRAPHIC SHAPES on a transparent background. 
+- NEVER use the words "text", "title", "writing", "script", "characters", "letters", "words", or "font" when referring to these images. The image generator will try to re-render text if you describe them that way.
+- Instead, describe them as: "graphic in the first attachement" etc. Otherwise capture the meaning of the raw prompt. Examples:
+    * 'Use [bengali text] as the title' becomes 'Use the image in first attachment as the title'
+    * 'Render [bengali text] in small font next to the flower' becomes 'Render the image in first attachment in a small size next to the flower'
+- Rewrite the prompt to retain raw user instruction regarding placement (e.g. "on top") etc, but rephrase as to
+  reference the input as a image, graphic etc.
+- The graphic images have a white background. Always include this instruction: "Blend the white background of the graphic seamlessly into the scene — treat the white area as transparent and integrate only the dark shapes into the composition."
 
 OUTPUT RULES:
 - Output ONLY the rewritten prompt — no explanations, no preamble
-- Do NOT include any Bengali Unicode characters in your output
+- CRITICAL: Your output must be pure ASCII/English. Do NOT include any Bengali/Bangla script (Unicode range U+0980–U+09FF) anywhere in your output. Never transliterate, quote, or reproduce any non-Latin script.
+- NEVER describe the overlay images as containing "text" or "writing" — always call them graphics/shapes/artwork.
 - Reference all images by their ordinal number
 - Be concise but precise about placement, styling, and composition"""
 
 
+MAX_REWRITE_RETRIES = 3
+
+
+def _contains_bengali(text: str) -> bool:
+    """Check if a string contains any Bengali Unicode characters."""
+    return bool(re.search(r'[\u0980-\u09FF]', text))
+
+
 def rewrite_prompt(raw_prompt: str, num_user_images: int, bengali_texts: list[str]) -> str:
-    """Call gpt-4o-mini to rewrite the user's prompt for image generation."""
+    """Call gpt-4o-mini to rewrite the user's prompt for image generation.
+    Retries up to MAX_REWRITE_RETRIES times if Bengali text leaks into the output."""
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     num_text_images = len(bengali_texts)
@@ -172,17 +246,32 @@ Bengali text strings extracted: {json.dumps(bengali_texts, ensure_ascii=False)}
 
 Rewrite this into a clean image-generation prompt following the rules."""
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
-        ],
-        temperature=0.3,
-        max_tokens=1024
-    )
+    messages = [
+        {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message}
+    ]
 
-    return response.choices[0].message.content.strip()
+    for attempt in range(MAX_REWRITE_RETRIES):
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=1024
+        )
+
+        result = response.choices[0].message.content.strip()
+
+        if not _contains_bengali(result):
+            return result
+
+        print(f"Rewrite attempt {attempt + 1}: Bengali text leaked, retrying...")
+        # Append the bad response and a correction request so the LLM learns from its mistake
+        messages.append({"role": "assistant", "content": result})
+        messages.append({"role": "user", "content": "Your output contains Bengali script characters. Rewrite it again using ONLY English/ASCII. Never include any Bengali characters. Refer to the overlay images only as 'the graphic from the Nth attached image' — never as text, title, or writing."})
+
+    # Final attempt still had Bengali — strip it out as a last resort
+    print("WARNING: Bengali text persisted after retries, stripping it from output")
+    return re.sub(r'[\u0980-\u09FF]+', '', result).strip()
 
 
 def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[Image.Image], user_images: list[Image.Image] = None, rewritten_prompt: str = None) -> dict:
@@ -206,9 +295,10 @@ def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[
             for text in bengali_texts:
                 rewritten_prompt = rewritten_prompt.replace(text, "[TEXT FROM IMAGE]")
             rewritten_prompt = re.sub(r'["\']?\[TEXT FROM IMAGE\]["\']?', '[TEXT FROM IMAGE]', rewritten_prompt)
-            rewritten_prompt += "\n\nCRITICAL INSTRUCTION: I am providing a reference image containing text. "
-            rewritten_prompt += "You MUST copy this exact text into the generated image - do not recreate or modify it. "
-            rewritten_prompt += "Use the text from the reference image exactly as rendered, placing it appropriately based on context."
+            rewritten_prompt += "\n\nCRITICAL INSTRUCTION: I am providing a reference image containing a graphic design element. "
+            rewritten_prompt += "Composite this graphic into the generated image exactly as-is — preserve its exact shapes. "
+            rewritten_prompt += "Do not redraw, reinterpret, or alter the shapes. Place the graphic appropriately based on context. "
+            rewritten_prompt += "Blend the white background of the graphic seamlessly into the scene — treat the white area as transparent and integrate only the dark shapes into the composition."
 
     # Build contents list: user uploads first, then rendered Bengali text, then prompt
     contents = []
@@ -817,8 +907,8 @@ HTML_TEMPLATE = '''
                     <div class="example-chip" onclick="setPrompt('A birthday card with \\'শুভ জন্মদিন\\' written beautifully, balloons and confetti')">
                         Birthday card · <span class="bengali">শুভ জন্মদিন</span>
                     </div>
-                    <div class="example-chip" onclick="setPrompt('A book cover with title \\'রবীন্দ্রনাথের কবিতা\\', elegant vintage design')">
-                        Book cover · <span class="bengali">রবীন্দ্রনাথের কবিতা</span>
+                    <div class="example-chip" onclick="setPrompt('A book cover with title \\'চর্যাপদ\\', elegant vintage design')">
+                        Book cover · <span class="bengali">চর্যাপদ</span>
                     </div>
                     <div class="example-chip" onclick="setPrompt('A shop sign that says \\'মিষ্টির দোকান\\', traditional Bengali sweet shop')">
                         Shop sign · <span class="bengali">মিষ্টির দোকান</span>
@@ -833,6 +923,13 @@ HTML_TEMPLATE = '''
                     <div class="upload-area-text"><strong>Click to upload</strong> or drag and drop</div>
                 </div>
                 <div class="upload-thumbnails" id="uploadThumbnails"></div>
+            </div>
+
+            <div style="margin-bottom: 1.25rem;">
+                <label style="display: inline-flex; align-items: center; gap: 0.5rem; cursor: pointer; user-select: none;">
+                    <input type="checkbox" id="maskText" checked style="width: 16px; height: 16px; accent-color: var(--accent);">
+                    <span style="font-size: 0.85rem; color: var(--text-secondary);">Mask text (disguise as graphic — use for longer text that the model tries to re-render)</span>
+                </label>
             </div>
 
             <div style="display: flex; gap: 0.75rem;">
@@ -1006,10 +1103,11 @@ HTML_TEMPLATE = '''
             resultCard.style.display = 'none';
 
             try {
+                const mask_text = document.getElementById('maskText').checked;
                 const response = await fetch('/render', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt })
+                    body: JSON.stringify({ prompt, mask_text })
                 });
 
                 const data = await response.json();
@@ -1061,11 +1159,13 @@ HTML_TEMPLATE = '''
             bengaliPreview.innerHTML = '';
 
             try {
+                const mask_text = document.getElementById('maskText').checked;
+
                 // Step 1: Quickly render Bengali text and show preview
                 const renderResponse = await fetch('/render', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt })
+                    body: JSON.stringify({ prompt, mask_text })
                 });
 
                 const renderData = await renderResponse.json();
@@ -1083,7 +1183,7 @@ HTML_TEMPLATE = '''
 
                 // Step 2: Call generate with prompt + user images
                 // Use cached rewritten prompt if inputs haven't changed
-                const payload = { prompt: prompt, user_images: uploadedFiles };
+                const payload = { prompt: prompt, user_images: uploadedFiles, mask_text };
                 if (rewriteCache.prompt === prompt && rewriteCache.numImages === uploadedFiles.length && rewriteCache.rewrittenPrompt) {
                     payload.rewritten_prompt = rewriteCache.rewrittenPrompt;
                     status.innerHTML = '<span class="spinner"></span> Generating image (using cached prompt)...';
@@ -1136,6 +1236,7 @@ def render():
     """Quick endpoint to just render Bengali text - called first for immediate preview."""
     data = request.json
     prompt = data.get('prompt', '')
+    mask = data.get('mask_text', False)
 
     if not prompt:
         return jsonify({"bengali_texts": [], "rendered_texts": []})
@@ -1146,7 +1247,7 @@ def render():
     # Render Bengali text as images
     rendered_b64 = []
     for text in bengali_texts:
-        img = render_bengali_text(text)
+        img = render_bengali_text(text, mask=mask)
         rendered_b64.append(image_to_base64(img))
 
     return jsonify({
@@ -1217,9 +1318,10 @@ def preview_prompt():
     cleaned_prompt = re.sub(r'["\']?\[TEXT FROM IMAGE\]["\']?', '[TEXT FROM IMAGE]', cleaned_prompt)
 
     enhanced_prompt = cleaned_prompt + "\n\n"
-    enhanced_prompt += "CRITICAL INSTRUCTION: I am providing a reference image containing text. "
-    enhanced_prompt += "You MUST copy this exact text into the generated image - do not recreate or modify it. "
-    enhanced_prompt += "Use the text from the reference image exactly as rendered, placing it appropriately based on context (e.g., as a title at the top for a poster)."
+    enhanced_prompt += "CRITICAL INSTRUCTION: I am providing a reference image containing a graphic design element. "
+    enhanced_prompt += "Composite this graphic into the generated image exactly as-is — preserve its exact shapes. "
+    enhanced_prompt += "Do not redraw, reinterpret, or alter the shapes. Place the graphic appropriately based on context (e.g., centered on a poster, top of a cover). "
+    enhanced_prompt += "Blend the white background of the graphic seamlessly into the scene — treat the white area as transparent and integrate only the dark shapes into the composition."
 
     return jsonify({
         "original_prompt": prompt,
@@ -1235,6 +1337,7 @@ def generate():
     prompt = data.get('prompt', '')
     user_images_b64 = data.get('user_images', [])
     cached_rewritten_prompt = data.get('rewritten_prompt', None)
+    mask = data.get('mask_text', False)
 
     if not prompt:
         return jsonify({"success": False, "error": "No prompt provided"})
@@ -1259,7 +1362,7 @@ def generate():
     rendered_images = []
     rendered_b64 = []
     for text in bengali_texts:
-        img = render_bengali_text(text)
+        img = render_bengali_text(text, mask=mask)
         rendered_images.append(img)
         rendered_b64.append(image_to_base64(img))
 

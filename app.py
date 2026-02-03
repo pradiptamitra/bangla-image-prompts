@@ -928,7 +928,7 @@ HTML_TEMPLATE = '''
             <div style="margin-bottom: 1.25rem;">
                 <label style="display: inline-flex; align-items: center; gap: 0.5rem; cursor: pointer; user-select: none;">
                     <input type="checkbox" id="maskText" checked style="width: 16px; height: 16px; accent-color: var(--accent);">
-                    <span style="font-size: 0.85rem; color: var(--text-secondary);">Mask text (disguise as graphic — use for longer text that the model tries to re-render)</span>
+                    <span style="font-size: 0.85rem; color: var(--text-secondary);">Mask text (overlays shapes to prevent the model from reading and re-rendering the text)</span>
                 </label>
             </div>
 

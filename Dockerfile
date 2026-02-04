@@ -1,13 +1,28 @@
 FROM python:3.12-slim
 
+# System libs needed for Pillow source build with raqm support
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libraqm-dev \
+        libfribidi-dev \
+        libharfbuzz-dev \
+        libfreetype6-dev \
+        libjpeg62-turbo-dev \
+        zlib1g-dev \
+        build-essential \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.txt .
 
-# Official Pillow Linux wheels bundle libraqm, so no source build needed
-RUN pip install --no-cache-dir -r requirements.txt
+# Install everything except Pillow with pre-built wheels (fast),
+# then build only Pillow from source so it links against system libraqm
+RUN pip install --no-cache-dir gunicorn flask openai google-genai && \
+    pip install --no-cache-dir --no-binary pillow pillow
 
-# Verify raqm support (bundled in Pillow's manylinux wheel)
+# Verify raqm support
 RUN python -c "from PIL import features; assert features.check('raqm'), 'raqm not available!'"
 
 COPY . .

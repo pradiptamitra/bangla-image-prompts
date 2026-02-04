@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.git
+.env
+test_*.png
+tagore.png
+JOURNAL.md
+README.md
+Claude.md

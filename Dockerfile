@@ -1,12 +1,17 @@
 FROM python:3.12-slim
 
-# Install system dependencies for libraqm (Bengali text shaping)
+# Install system dependencies for libraqm (Bengali text shaping) + Pillow build deps
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libraqm-dev \
         libfribidi-dev \
         libharfbuzz-dev \
         libfreetype6-dev \
+        libjpeg62-turbo-dev \
+        zlib1g-dev \
+        liblcms2-dev \
+        libwebp-dev \
+        libtiff-dev \
         build-essential \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
@@ -17,7 +22,7 @@ COPY requirements.txt .
 
 # Install Python deps — build Pillow from source so it links against libraqm
 RUN pip install --no-cache-dir gunicorn flask openai google-genai && \
-    pip install --no-cache-dir --no-binary pillow pillow
+    pip install --no-cache-dir --no-binary :all: pillow
 
 # Verify raqm support
 RUN python -c "from PIL import features; assert features.check('raqm'), 'raqm not available!'"

@@ -8,7 +8,7 @@ This app works around that limitation:
 3. The app sends the rendered image + rewritten prompt to Gemini
 4. Gemini places your pre-rendered text into the generated image
 
-**Live demo:** [your-railway-url.up.railway.app](https://your-railway-url.up.railway.app)
+**Live demo:** [bangla-image-prompts-production.up.railway.app](https://bangla-image-prompts-production.up.railway.app/)
 
 ## Quick Start (Local)
 

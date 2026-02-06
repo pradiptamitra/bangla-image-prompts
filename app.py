@@ -27,7 +27,7 @@ from flask import Flask, render_template_string, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
 from google import genai
-from google.genai import types
+from google.genai.types import GenerateContentConfig, ImageConfig
 
 app = Flask(__name__)
 
@@ -314,6 +314,9 @@ def generate_image(prompt: str, bengali_texts: list[str], rendered_images: list[
         response = client.models.generate_content(
             model="gemini-2.5-flash-image",
             contents=contents,
+            config=GenerateContentConfig(
+                image_config=ImageConfig(aspect_ratio="1:1")
+            ),
         )
 
         result_b64 = None
@@ -1460,6 +1463,9 @@ def generate():
             response = client.models.generate_content(
                 model="gemini-2.5-flash-image",
                 contents=[rewritten],
+                config=GenerateContentConfig(
+                    image_config=ImageConfig(aspect_ratio="1:1")
+                ),
             )
 
             result_b64 = None

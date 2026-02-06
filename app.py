@@ -22,7 +22,7 @@ import re
 import base64
 import json
 from io import BytesIO
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 
 from PIL import Image, ImageDraw, ImageFont
 from openai import OpenAI
@@ -30,8 +30,10 @@ from google import genai
 from google.genai import types
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
 
 # Configuration
+ACCESS_CODE = os.environ.get("ACCESS_CODE")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # Font paths for different operating systems
@@ -1226,12 +1228,124 @@ HTML_TEMPLATE = '''
 '''
 
 
+LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access Required</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0a0a0b;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fafafa;
+        }
+        .login-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 20px;
+            padding: 2.5rem;
+            width: 100%;
+            max-width: 360px;
+            text-align: center;
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        p {
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 0.9rem;
+            margin-bottom: 1.5rem;
+        }
+        input {
+            width: 100%;
+            padding: 0.875rem 1rem;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: #141416;
+            color: #fafafa;
+            font-size: 1rem;
+            margin-bottom: 1rem;
+            text-align: center;
+        }
+        input:focus {
+            outline: none;
+            border-color: #6366f1;
+        }
+        button {
+            width: 100%;
+            padding: 0.875rem;
+            border-radius: 10px;
+            border: none;
+            background: #6366f1;
+            color: white;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #818cf8;
+        }
+        .error {
+            color: #ef4444;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <h1>Access Required</h1>
+        <p>Enter the access code to continue</p>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <input type="password" name="code" placeholder="Access code" autofocus>
+            <button type="submit">Enter</button>
+        </form>
+    </div>
+</body>
+</html>
+'''
+
+
+def require_access(f):
+    """Decorator to require access code for a route."""
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if ACCESS_CODE and not session.get('authenticated'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if not ACCESS_CODE:
+        return redirect(url_for('index'))
+    if request.method == 'POST':
+        if request.form.get('code') == ACCESS_CODE:
+            session['authenticated'] = True
+            return redirect(url_for('index'))
+        return render_template_string(LOGIN_TEMPLATE, error='Invalid code')
+    return render_template_string(LOGIN_TEMPLATE, error=None)
+
+
 @app.route('/')
+@require_access
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 
 @app.route('/render', methods=['POST'])
+@require_access
 def render():
     """Quick endpoint to just render Bengali text - called first for immediate preview."""
     data = request.json
@@ -1257,6 +1371,7 @@ def render():
 
 
 @app.route('/rewrite-prompt', methods=['POST'])
+@require_access
 def rewrite_prompt_endpoint():
     """Rewrite a prompt using gpt-4o-mini."""
     data = request.json
@@ -1285,6 +1400,7 @@ def rewrite_prompt_endpoint():
 
 
 @app.route('/preview-prompt', methods=['POST'])
+@require_access
 def preview_prompt():
     """Show the prompt that would be sent to OpenAI without calling the API."""
     data = request.json
@@ -1332,6 +1448,7 @@ def preview_prompt():
 
 
 @app.route('/generate', methods=['POST'])
+@require_access
 def generate():
     data = request.json
     prompt = data.get('prompt', '')
